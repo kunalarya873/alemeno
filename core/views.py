@@ -1,13 +1,13 @@
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
-from .models import Customer
-from django.db.utils import IntegrityError
-from .models import Loan
+from .models import Customer,Loan
 from .utils import calculate_credit_score
 from .serializers import RegisterCustomerSerializer
 from decimal import Decimal
 from datetime import datetime, timedelta
+import pandas as pd
+from django.core.exceptions import ValidationError
 
 
 class RegisterCustomerView(APIView):
@@ -171,3 +171,110 @@ class ViewLoansByCustomer(APIView):
             return Response(loan_data, status=status.HTTP_200_OK)
         except Customer.DoesNotExist:
             return Response({'error': 'Customer not found'}, status=status.HTTP_404_NOT_FOUND)
+
+import pandas as pd
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework import status
+from django.core.exceptions import ValidationError
+from .models import Customer, Loan
+from datetime import datetime
+from decimal import Decimal
+
+class ImportDataFromExcel(APIView):
+
+    def post(self, request):
+        try:
+            # Check if file is provided
+            if 'file' not in request.FILES:
+                return Response({'error': 'No file provided'}, status=status.HTTP_400_BAD_REQUEST)
+
+            file = request.FILES['file']
+            
+            # Read the Excel file using pandas
+            df = pd.read_excel(file)
+            df.columns = df.columns.str.strip()  # Remove any leading/trailing spaces
+
+            # Process customer data - now using only Customer ID
+            self.import_customers(df)
+
+            # Process loan data
+            self.import_loans(df)
+
+            return Response({'message': 'Data successfully imported'}, status=status.HTTP_201_CREATED)
+
+        except Exception as e:
+            return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    def import_customers(self, df):
+        # Process customer data, only using Customer ID
+        customer_data = df[['Customer ID']]  # Only using Customer ID now
+        customers = []
+        for _, row in customer_data.iterrows():
+            # Check for missing Customer ID and skip invalid rows
+            if pd.isna(row['Customer ID']):
+                continue  # Skip rows with no Customer ID
+            
+            # Check if the customer already exists
+            customer_id = row['Customer ID']
+            if Customer.objects.filter(customer_id=customer_id).exists():
+                # Skip customer if already exists
+                continue  # Skip duplicate customers
+            
+            # Create a customer (with minimal information, since we only need the Customer ID)
+            customer = Customer(
+                customer_id=customer_id,
+                first_name="Unknown",  # Default value for first name
+                last_name="Unknown",   # Default value for last name
+                phone_number="Unknown",  # Default value for phone number
+                monthly_salary=0,  # Default value for monthly salary
+                approved_limit=0,  # Default value for approved limit
+                current_debt=0,  # Default value for current debt
+                age=0  # Default value for age
+            )
+            customers.append(customer)
+
+        # Bulk create customer records (only using Customer ID)
+        if customers:
+            Customer.objects.bulk_create(customers)
+
+    def import_loans(self, df):
+        # Process loan data
+        loan_data = df[['Customer ID', 'Loan ID', 'Loan Amount', 'Tenure', 'Interest Rate', 'Monthly payment', 'EMIs paid on Time', 'Date of Approval', 'End Date']]
+        loans = []
+        for _, row in loan_data.iterrows():
+            try:
+                customer = Customer.objects.get(customer_id=row['Customer ID'])
+            except Customer.DoesNotExist:
+                raise ValidationError(f"Customer with ID {row['Customer ID']} does not exist")
+
+            loan_amount = row['Loan Amount']
+            interest_rate = row['Interest Rate']
+            tenure = row['Tenure']
+            
+            # Parsing date with pd.to_datetime() to handle various formats
+            start_date = pd.to_datetime(row['Date of Approval'], errors='coerce').date()  # Parse and convert to date only
+            end_date = pd.to_datetime(row['End Date'], errors='coerce').date()  # Parse and convert to date only
+
+            # Ensure that the date parsing was successful
+            if pd.isna(start_date) or pd.isna(end_date):
+                raise ValidationError(f"Invalid date format for customer {row['Customer ID']}")
+
+            # Calculate monthly repayment
+            monthly_repayment = Decimal(str(row['Monthly payment']))
+
+            loan = Loan(
+                customer=customer,
+                loan_amount=loan_amount,
+                interest_rate=interest_rate,
+                tenure=tenure,
+                monthly_repayment=monthly_repayment,
+                emis_paid_on_time=row['EMIs paid on Time'],
+                start_date=start_date,
+                end_date=end_date
+            )
+            loans.append(loan)
+
+        # Bulk create loan records
+        if loans:
+            Loan.objects.bulk_create(loans)
